@@ -1,5 +1,6 @@
 export default {
   async fetch(request, env, ctx) {
+    const SHELL_URL = "https://zany-acorn-vppj4x56767vf69rr-3333.app.github.dev";
     const url = new URL(request.url);
 
     const corsHeaders = {
@@ -96,6 +97,17 @@ export default {
                 },
                 required: ["url"]
               }
+            },
+            {
+              name: "run_shell",
+              description: "Run a bash/Linux terminal command on the remote cloud shell and return its output",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  command: { type: "string", description: "The bash command to execute" }
+                },
+                required: ["command"]
+              }
             }
           ]
         }, corsHeaders);
@@ -123,6 +135,19 @@ export default {
           }, corsHeaders);
         }
 
+        if (toolName === "run_shell") {
+          const res = await fetch(SHELL_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command: args.command })
+          });
+          const data = await res.json();
+
+          return jsonRpc(id, {
+            content: [{ type: "text", text: data.output || "Done" }]
+          }, corsHeaders);
+        }
+
         return jsonRpcError(id, -32601, `Unknown tool: ${toolName}`, corsHeaders);
       }
 
@@ -144,5 +169,4 @@ function jsonRpcError(id, code, message, headers) {
     status: 200,
     headers: { ...headers, "Content-Type": "application/json" }
   });
-  }
-                     
+}
