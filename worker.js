@@ -99,8 +99,8 @@ export default {
               }
             },
             {
-              name: "run_shell",
-              description: "Run a bash/Linux terminal command on the remote cloud shell and return its output",
+              name: "codespace_exec",
+              description: "Execute a real Linux bash command on the remote GitHub Codespace cloud server (supports uname, python3, git, curl, objdump, strings, etc.)",
               inputSchema: {
                 type: "object",
                 properties: {
@@ -135,7 +135,7 @@ export default {
           }, corsHeaders);
         }
 
-        if (toolName === "run_shell") {
+        if (toolName === "codespace_exec") {
           const res = await fetch(SHELL_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
