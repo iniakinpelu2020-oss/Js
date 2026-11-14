@@ -3,7 +3,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Runner-Url, X-Runner-Token, X-Timeout-Ms",
+      "Access-Control-Allow-Headers": "*",
       "Access-Control-Allow-Private-Network": "true",
     };
 
@@ -130,7 +130,7 @@ export default {
                 return mcpToolError(id, `Failed to fetch ${path}: HTTP ${res.status}`, corsHeaders);
               }
               const content = await res.text();
-              return mcpToolSuccess(id, content.slice(0, 100000), corsHeaders);
+              return mcpToolSuccess(id, content.slice(0, 30000), corsHeaders);
             } else {
               const treeUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(
                 repo
@@ -149,7 +149,7 @@ export default {
                 return mcpToolError(id, `GitHub API returned HTTP ${res.status} for ${owner}/${repo}`, corsHeaders);
               }
               const data = await res.json();
-              const files = (data.tree || []).map((item) => `${item.type === "tree" ? "[DIR] " : ""}${item.path}`);
+              const files = (data.tree || []).slice(0, 150).map((item) => `${item.type === "tree" ? "[DIR] " : ""}${item.path}`);
               return mcpToolSuccess(id, files.join("\n") || "Empty repository", corsHeaders);
             }
           }
@@ -242,7 +242,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 600000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { ...options, redirect: "manual", signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
