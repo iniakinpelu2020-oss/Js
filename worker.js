@@ -1,5 +1,38 @@
 export default {
   async fetch(request, env) {
+    const url = new URL(request.url);
+
+    // n8n MCP proxy — handle before any catch-all handlers
+    if (url.pathname === "/n8n-mcp" || url.pathname.startsWith("/n8n-mcp/")) {
+      const n8nCors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      };
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: n8nCors });
+      }
+      const body = await request.text();
+      const upstream = await fetch("https://drippydee.app.n8n.cloud/mcp-server/http", {
+        method: request.method,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          Authorization: request.headers.get("Authorization") || "Bearer " + (env.N8N_MCP_TOKEN || ""),
+        },
+        body: request.method !== "GET" && request.method !== "HEAD" ? body : undefined,
+      });
+      const responseHeaders = new Headers(upstream.headers);
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: responseHeaders,
+      });
+    }
+
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -10,8 +43,6 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders });
     }
-
-    const url = new URL(request.url);
 
     // Health check endpoint
     if (request.method === "GET" && url.pathname === "/") {
