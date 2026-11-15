@@ -331,15 +331,37 @@ function handleStream(result, corsHeaders) {
   const stream = new TransformStream();
   const writer = stream.writable.getWriter();
 
-  const emitChunk = (content, finishReason) => {
+  const emitChunk = (content, finishReason, toolCalls) => {
+    const delta = {};
+    if (content) delta.content = content;
+    if (toolCalls) delta.tool_calls = toolCalls;
     const out = JSON.stringify({
       id: "chatcmpl-cf",
       object: "chat.completion.chunk",
       created: Math.floor(Date.now() / 1000),
       model: PRIMARY_MODEL_NAME,
-      choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
     });
     return writer.write(encoder.encode(`data: ${out}\n\n`));
+  };
+
+  const extractToolCalls = (parsed) => {
+    if (!parsed) return null;
+    if (parsed.tool_calls && Array.isArray(parsed.tool_calls)) {
+      return parsed.tool_calls.map((tc) => ({
+        index: tc.index ?? 0,
+        id: tc.id ?? `call_${Math.random().toString(36).slice(2)}`,
+        type: "function",
+        function: {
+          name: tc.function?.name ?? tc.name ?? "",
+          arguments: JSON.stringify(tc.function?.arguments ?? tc.arguments ?? {}),
+        },
+      }));
+    }
+    if (parsed.choices?.[0]?.delta?.tool_calls) {
+      return parsed.choices[0].delta.tool_calls;
+    }
+    return null;
   };
 
   (async () => {
@@ -369,8 +391,9 @@ function handleStream(result, corsHeaders) {
             parsed.choices?.[0]?.delta?.content ??
             parsed.text ??
             "";
-          if (content) {
-            await emitChunk(content, null);
+          const toolCalls = extractToolCalls(parsed);
+          if (content || toolCalls) {
+            await emitChunk(content, null, toolCalls);
           }
         }
       }
@@ -398,6 +421,39 @@ function handleNonStream(result, corsHeaders) {
     result?.choices?.[0]?.message?.content ||
     result?.choices?.[0]?.text ||
     JSON.stringify(result);
+
+  const rawToolCalls =
+    result?.choices?.[0]?.message?.tool_calls ??
+    result?.tool_calls ??
+    (() => {
+      try {
+        const obj = JSON.parse(text);
+        if (obj && obj.name && typeof obj.arguments === "object") {
+          return [{ index: 0, id: `call_${Math.random().toString(36).slice(2)}`, type: "function", function: { name: obj.name, arguments: JSON.stringify(obj.arguments) } }];
+        }
+      } catch {
+        // not JSON
+      }
+      return null;
+    })();
+
+  if (rawToolCalls) {
+    const out = {
+      id: "chatcmpl-worker",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "@cf/qwen/qwen2.5-coder-32b-instruct",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: null, tool_calls: rawToolCalls },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: result?.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+    return jsonResponse(out, 200, corsHeaders);
+  }
 
   const out = {
     id: "chatcmpl-worker",
