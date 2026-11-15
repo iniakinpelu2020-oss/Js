@@ -262,9 +262,134 @@ export default {
       }
     }
 
+    // n8n MCP endpoint — serves distinct n8n automation tools
+    if (request.method === "POST" && url.pathname === "/n8n-mcp") {
+      return handleN8nMcp(request, env, corsHeaders);
+    }
+
     return jsonResponse({ error: "Not found" }, 404, corsHeaders);
   },
 };
+
+async function handleN8nMcp(request, env, corsHeaders) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return jsonResponse({ error: { message: "Invalid JSON body" } }, 400, corsHeaders);
+  }
+
+  const { id, method, params } = body;
+  const args = params?.arguments || {};
+
+  if (method === "initialize") {
+    return jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "n8n-mcp", version: "1.0.0" },
+        },
+      },
+      200,
+      corsHeaders
+    );
+  }
+
+  if (method === "tools/list") {
+    return jsonResponse(
+      {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: [
+            {
+              name: "trigger_n8n_webhook",
+              description: "Trigger an n8n webhook by sending a JSON payload to a webhook URL.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  webhook_url: { type: "string", description: "The n8n webhook URL to POST to" },
+                  payload: { type: "object", description: "Optional JSON payload to send" },
+                },
+                required: ["webhook_url"],
+              },
+            },
+            {
+              name: "check_n8n_health",
+              description: "Check if the n8n instance is reachable via its /healthz endpoint.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  base_url: { type: "string", description: "n8n base URL (defaults to env.N8N_BASE_URL)" },
+                },
+              },
+            },
+          ],
+        },
+      },
+      200,
+      corsHeaders
+    );
+  }
+
+  if (method === "tools/call") {
+    const toolName = params?.name;
+
+    if (toolName === "trigger_n8n_webhook") {
+      if (!args.webhook_url) {
+        return mcpToolError(id, "Missing required parameter: webhook_url", corsHeaders);
+      }
+      try {
+        const res = await fetchWithTimeout(args.webhook_url, {
+          method: "POST",
+          redirect: "manual",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(args.payload || {}),
+        }, 60000);
+        const text = await res.text();
+        return mcpToolSuccess(
+          id,
+          JSON.stringify({ status: res.status, statusText: res.statusText, body: text.slice(0, 10000) }),
+          corsHeaders
+        );
+      } catch (err) {
+        return mcpToolError(id, `Webhook request failed: ${err.message || "Unknown error"}`, corsHeaders);
+      }
+    }
+
+    if (toolName === "check_n8n_health") {
+      const baseUrl = (args.base_url || env.N8N_BASE_URL || "").replace(/\/$/, "");
+      if (!baseUrl) {
+        return mcpToolError(id, "No base_url provided and env.N8N_BASE_URL is not set", corsHeaders);
+      }
+      try {
+        const res = await fetchWithTimeout(`${baseUrl}/healthz`, {
+          method: "GET",
+          redirect: "manual",
+        }, 30000);
+        const text = await res.text();
+        return mcpToolSuccess(
+          id,
+          JSON.stringify({ reachable: res.ok, status: res.status, body: text.slice(0, 1000) }),
+          corsHeaders
+        );
+      } catch (err) {
+        return mcpToolError(id, `Health check failed: ${err.message || "Unknown error"}`, corsHeaders);
+      }
+    }
+
+    return mcpToolError(id, `Unknown tool: ${toolName}`, corsHeaders);
+  }
+
+  return jsonResponse(
+    { jsonrpc: "2.0", id: id ?? null, error: { code: -32601, message: `Method not found: ${method}` } },
+    200,
+    corsHeaders
+  );
+}
 
 async function handleChat(request, env, corsHeaders) {
   const PRIMARY_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
