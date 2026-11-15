@@ -285,7 +285,7 @@ async function handleChat(request, env, corsHeaders) {
     messages,
     ...(tools ? { tools } : {}),
     ...(temperature !== undefined ? { temperature } : {}),
-    ...(max_tokens !== undefined ? { max_tokens } : {}),
+    ...(max_tokens !== undefined ? { max_tokens } : { max_tokens: 4096 }),
     stream,
   });
 
