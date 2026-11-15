@@ -297,6 +297,9 @@ async function handleN8nMcp(request, env, corsHeaders) {
     );
 
     const responseHeaders = new Headers(corsHeaders);
+    responseHeaders.set("Access-Control-Allow-Origin", "*");
+    responseHeaders.set("Access-Control-Allow-Headers", "*");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     const ct = res.headers.get("content-type");
     if (ct) responseHeaders.set("Content-Type", ct);
     const cache = res.headers.get("cache-control");
