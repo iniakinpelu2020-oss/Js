@@ -27,8 +27,31 @@ export default {
       );
     }
 
-    // AI chat endpoint (/api/chat) — proxies through Cloudflare Workers AI binding
-    if (request.method === "POST" && url.pathname === "/api/chat") {
+    // AI model list endpoints (header status dot)
+    if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/api/models")) {
+      return jsonResponse(
+        {
+          object: "list",
+          data: [
+            { id: "@cf/qwen/qwen2.5-coder-32b-instruct", object: "model" },
+            { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", object: "model" },
+          ],
+        },
+        200,
+        corsHeaders
+      );
+    }
+
+    // AI health endpoint
+    if (request.method === "GET" && url.pathname === "/api/health") {
+      return jsonResponse({ status: "ok", worker: "apex-mcp" }, 200, corsHeaders);
+    }
+
+    // AI chat endpoint — accepts both /api/chat and /v1/chat/completions
+    if (
+      request.method === "POST" &&
+      (url.pathname === "/api/chat" || url.pathname === "/v1/chat/completions")
+    ) {
       return handleChat(request, env, corsHeaders);
     }
 
@@ -246,7 +269,6 @@ export default {
 async function handleChat(request, env, corsHeaders) {
   const PRIMARY_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
   const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-
   let body;
   try {
     body = await request.json();
@@ -309,6 +331,17 @@ function handleStream(result, corsHeaders) {
   const stream = new TransformStream();
   const writer = stream.writable.getWriter();
 
+  const emitChunk = (content, finishReason) => {
+    const out = JSON.stringify({
+      id: "chatcmpl-cf",
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: PRIMARY_MODEL_NAME,
+      choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }],
+    });
+    return writer.write(encoder.encode(`data: ${out}\n\n`));
+  };
+
   (async () => {
     try {
       const reader = result.getReader();
@@ -321,6 +354,7 @@ function handleStream(result, corsHeaders) {
           let data = line;
           if (data.startsWith("data: ")) data = data.slice(6);
           if (data === "[DONE]") {
+            await emitChunk(null, "stop");
             await writer.write(encoder.encode("data: [DONE]\n\n"));
             continue;
           }
@@ -330,18 +364,16 @@ function handleStream(result, corsHeaders) {
           } catch {
             continue;
           }
-          const delta = parsed.response || parsed.text || parsed.delta || parsed.choices?.[0]?.delta || {};
-          const out = JSON.stringify({
-            id: "chatcmpl-worker",
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: "@cf/qwen/qwen2.5-coder-32b-instruct",
-            choices: [{ index: 0, delta, finish_reason: null }],
-          });
-          await writer.write(encoder.encode(`data: ${out}\n\n`));
+          const content =
+            parsed.response ??
+            parsed.choices?.[0]?.delta?.content ??
+            parsed.text ??
+            "";
+          if (content) {
+            await emitChunk(content, null);
+          }
         }
       }
-      await writer.write(encoder.encode("data: [DONE]\n\n"));
       await writer.close();
     } catch (err) {
       await writer.abort(err);
@@ -383,6 +415,8 @@ function handleNonStream(result, corsHeaders) {
   };
   return jsonResponse(out, 200, corsHeaders);
 }
+
+const PRIMARY_MODEL_NAME = "@cf/qwen/qwen2.5-coder-32b-instruct";
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 600000) {
   const controller = new AbortController();
