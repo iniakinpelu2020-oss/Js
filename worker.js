@@ -262,7 +262,8 @@ export default {
       }
     }
 
-    // n8n MCP endpoint — serves distinct n8n automation tools
+    // n8n MCP endpoint — direct REST integration with n8n instance
+
     if (request.method === "POST" && url.pathname === "/n8n-mcp") {
       return handleN8nMcp(request, env, corsHeaders);
     }
@@ -275,7 +276,8 @@ async function handleN8nMcp(request, env, corsHeaders) {
   let body;
   try {
     body = await request.json();
-  } catch (err) {
+  } catch {
+
     return jsonResponse({ error: { message: "Invalid JSON body" } }, 400, corsHeaders);
   }
 
@@ -290,7 +292,8 @@ async function handleN8nMcp(request, env, corsHeaders) {
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {} },
-          serverInfo: { name: "n8n-mcp", version: "1.0.0" },
+          serverInfo: { name: "n8n-mcp", version: "2.0.0" },
+
         },
       },
       200,
@@ -306,25 +309,29 @@ async function handleN8nMcp(request, env, corsHeaders) {
         result: {
           tools: [
             {
-              name: "trigger_n8n_webhook",
-              description: "Trigger an n8n webhook by sending a JSON payload to a webhook URL.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  webhook_url: { type: "string", description: "The n8n webhook URL to POST to" },
-                  payload: { type: "object", description: "Optional JSON payload to send" },
-                },
-                required: ["webhook_url"],
-              },
+              name: "list_n8n_workflows",
+              description:
+                "List active n8n workflows with id, name, active status, and webhook paths so available automations are known.",
+              inputSchema: { type: "object", properties: {} },
             },
             {
-              name: "check_n8n_health",
-              description: "Check if the n8n instance is reachable via its /healthz endpoint.",
+              name: "run_n8n_automation",
+              description:
+                "Run an n8n automation by workflow name or ID (or configured webhook preset). Automatically finds and triggers the matching workflow with provided data.",
               inputSchema: {
                 type: "object",
                 properties: {
-                  base_url: { type: "string", description: "n8n base URL (defaults to env.N8N_BASE_URL)" },
+                  workflow_name_or_id: {
+                    type: "string",
+                    description: "Workflow name or ID to run (or a configured preset name)",
+                  },
+                  data: {
+                    type: "object",
+                    description: "Optional JSON payload to send to the automation",
+                  },
                 },
+                required: ["workflow_name_or_id"],
+
               },
             },
           ],
@@ -337,47 +344,194 @@ async function handleN8nMcp(request, env, corsHeaders) {
 
   if (method === "tools/call") {
     const toolName = params?.name;
+    const setupMessage =
+      "n8n is not configured yet. Add these two secrets in Cloudflare Dashboard → Workers → `fuck` → Settings → Variables and Secrets:\n" +
+      "1. `N8N_BASE_URL` — your n8n instance URL (e.g. https://your-n8n.example.com)\n" +
+      "2. `N8N_API_KEY` — your n8n API key (Settings → n8n API in your n8n instance)";
 
-    if (toolName === "trigger_n8n_webhook") {
-      if (!args.webhook_url) {
-        return mcpToolError(id, "Missing required parameter: webhook_url", corsHeaders);
+    if (toolName === "list_n8n_workflows") {
+      const baseUrl = (env.N8N_BASE_URL || "").replace(/\/$/, "");
+      const apiKey = env.N8N_API_KEY || "";
+      if (!baseUrl) {
+        return mcpToolError(id, setupMessage, corsHeaders);
       }
       try {
-        const res = await fetchWithTimeout(args.webhook_url, {
-          method: "POST",
-          redirect: "manual",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(args.payload || {}),
-        }, 60000);
-        const text = await res.text();
-        return mcpToolSuccess(
-          id,
-          JSON.stringify({ status: res.status, statusText: res.statusText, body: text.slice(0, 10000) }),
-          corsHeaders
+        const res = await fetchWithTimeout(
+          `${baseUrl}/api/v1/workflows`,
+          {
+            method: "GET",
+            headers: {
+              ...(apiKey ? { "X-N8N-API-KEY": apiKey } : {}),
+              Accept: "application/json",
+            },
+          },
+          30000
         );
+        const text = await res.text();
+        if (!res.ok) {
+          return mcpToolError(id, `Failed to fetch workflows (HTTP ${res.status}): ${text.slice(0, 1000)}`, corsHeaders);
+        }
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          return mcpToolError(id, `Invalid JSON from n8n workflows API: ${text.slice(0, 500)}`, corsHeaders);
+        }
+        const workflows = (data.data || data || []).map((w) => {
+          const webhooks = [];
+          (w.nodes || []).forEach((n) => {
+            if (n.type && n.type.toLowerCase().includes("webhook")) {
+              const path = n.parameters?.path || n.webhookId || null;
+              if (path) webhooks.push(`/webhook/${String(path).replace(/^\/+/, "")}`);
+            }
+          });
+          return { id: w.id, name: w.name, active: w.active, webhooks };
+        });
+        return mcpToolSuccess(id, JSON.stringify(workflows, null, 2), corsHeaders);
       } catch (err) {
-        return mcpToolError(id, `Webhook request failed: ${err.message || "Unknown error"}`, corsHeaders);
+        return mcpToolError(id, `Error listing workflows: ${err.message || "Unknown error"}`, corsHeaders);
       }
     }
 
-    if (toolName === "check_n8n_health") {
-      const baseUrl = (args.base_url || env.N8N_BASE_URL || "").replace(/\/$/, "");
-      if (!baseUrl) {
-        return mcpToolError(id, "No base_url provided and env.N8N_BASE_URL is not set", corsHeaders);
+    if (toolName === "run_n8n_automation") {
+      const nameOrId = String(args.workflow_name_or_id || "").trim();
+      const data = args.data || {};
+      if (!nameOrId) {
+        return mcpToolError(id, "Missing required parameter: workflow_name_or_id", corsHeaders);
       }
+
+      const baseUrl = (env.N8N_BASE_URL || "").replace(/\/$/, "");
+      const apiKey = env.N8N_API_KEY || "";
+
+      // Fallback: named webhook presets from env/vars (JSON: { "presetName": "https://..." })
+      let presets = {};
       try {
-        const res = await fetchWithTimeout(`${baseUrl}/healthz`, {
-          method: "GET",
-          redirect: "manual",
-        }, 30000);
-        const text = await res.text();
+        if (env.N8N_WEBHOOK_PRESETS) presets = JSON.parse(env.N8N_WEBHOOK_PRESETS);
+      } catch {
+        presets = {};
+      }
+      const presetUrl = presets[nameOrId];
+      if (presetUrl) {
+        try {
+          const res = await fetchWithTimeout(
+            presetUrl,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data),
+            },
+            60000
+          );
+          const text = await res.text();
+          return mcpToolSuccess(
+            id,
+            JSON.stringify({ source: "preset", status: res.status, statusText: res.statusText, body: text.slice(0, 10000) }),
+            corsHeaders
+          );
+        } catch (err) {
+          return mcpToolError(id, `Preset webhook request failed: ${err.message || "Unknown error"}`, corsHeaders);
+        }
+      }
+
+      if (!baseUrl) {
+        return mcpToolError(id, setupMessage, corsHeaders);
+      }
+
+      try {
+        // Look up workflows to find matching name or id
+        const listRes = await fetchWithTimeout(
+          `${baseUrl}/api/v1/workflows`,
+          {
+            method: "GET",
+            headers: {
+              ...(apiKey ? { "X-N8N-API-KEY": apiKey } : {}),
+              Accept: "application/json",
+            },
+          },
+          30000
+        );
+        const listText = await listRes.text();
+        if (!listRes.ok) {
+          return mcpToolError(id, `Failed to fetch workflows (HTTP ${listRes.status}): ${listText.slice(0, 1000)}`, corsHeaders);
+        }
+        let listData;
+        try {
+          listData = JSON.parse(listText);
+        } catch {
+          return mcpToolError(id, `Invalid JSON from n8n workflows API: ${listText.slice(0, 500)}`, corsHeaders);
+        }
+        const workflows = listData.data || listData || [];
+        const target = workflows.find(
+          (w) => String(w.id) === nameOrId || (w.name && w.name.toLowerCase() === nameOrId.toLowerCase())
+        );
+        if (!target) {
+          const names = workflows.slice(0, 20).map((w) => `${w.name} (${w.id})`).join(", ");
+          return mcpToolError(id, `Workflow not found: "${nameOrId}". Available: ${names || "none"}`, corsHeaders);
+        }
+
+        // Find webhook path from workflow nodes
+        let webhookPath = null;
+        (target.nodes || []).forEach((n) => {
+          if (!webhookPath && n.type && n.type.toLowerCase().includes("webhook")) {
+            const path = n.parameters?.path || n.webhookId || null;
+            if (path) webhookPath = String(path).replace(/^\/+/, "");
+          }
+        });
+
+        if (webhookPath) {
+          // Use test or production webhook URL; prefer production
+          const hookUrl = `${baseUrl}/webhook/${webhookPath}`;
+          const res = await fetchWithTimeout(
+            hookUrl,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(data),
+            },
+            60000
+          );
+          const text = await res.text();
+          return mcpToolSuccess(
+            id,
+            JSON.stringify({
+              workflow: { id: target.id, name: target.name },
+              webhook: hookUrl,
+              status: res.status,
+              statusText: res.statusText,
+              body: text.slice(0, 10000),
+            }),
+            corsHeaders
+          );
+        }
+
+        // Fallback: try to execute via n8n REST API if no webhook node found
+        const execRes = await fetchWithTimeout(
+          `${baseUrl}/api/v1/workflows/${encodeURIComponent(target.id)}/run`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(apiKey ? { "X-N8N-API-KEY": apiKey } : {}),
+            },
+            body: JSON.stringify({ data }),
+          },
+          60000
+        );
+        const execText = await execRes.text();
         return mcpToolSuccess(
           id,
-          JSON.stringify({ reachable: res.ok, status: res.status, body: text.slice(0, 1000) }),
+          JSON.stringify({
+            workflow: { id: target.id, name: target.name },
+            execution: "rest-api",
+            status: execRes.status,
+            statusText: execRes.statusText,
+            body: execText.slice(0, 10000),
+          }),
           corsHeaders
         );
       } catch (err) {
-        return mcpToolError(id, `Health check failed: ${err.message || "Unknown error"}`, corsHeaders);
+        return mcpToolError(id, `Error running automation: ${err.message || "Unknown error"}`, corsHeaders);
+
       }
     }
 
