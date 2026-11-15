@@ -20,11 +20,16 @@ export default {
           status: "ok",
           worker: "apex-mcp",
           timeoutMs: 600000,
-          tools: ["github_repo_inspect", "fetch_url_text", "codespace_exec"],
+          tools: ["github_repo_inspect", "fetch_url_text", "codespace_exec", "chat"],
         },
         200,
         corsHeaders
       );
+    }
+
+    // AI chat endpoint (/api/chat) — proxies through Cloudflare Workers AI binding
+    if (request.method === "POST" && url.pathname === "/api/chat") {
+      return handleChat(request, env, corsHeaders);
     }
 
     // MCP JSON-RPC endpoint
@@ -237,6 +242,147 @@ export default {
     return jsonResponse({ error: "Not found" }, 404, corsHeaders);
   },
 };
+
+async function handleChat(request, env, corsHeaders) {
+  const PRIMARY_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
+  const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (err) {
+    return jsonResponse({ error: { message: "Invalid JSON body" } }, 400, corsHeaders);
+  }
+
+  const { messages, tools, temperature, max_tokens, stream = false } = body;
+  if (!messages || !Array.isArray(messages)) {
+    return jsonResponse({ error: { message: "Missing required parameter: messages" } }, 400, corsHeaders);
+  }
+
+  const buildPayload = (model) => ({
+    messages,
+    ...(tools ? { tools } : {}),
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(max_tokens !== undefined ? { max_tokens } : {}),
+    stream,
+  });
+
+  const isRateOrCapacity = (err) => {
+    const msg = String(err.message || err).toLowerCase();
+    return (
+      msg.includes("rate") ||
+      msg.includes("capacity") ||
+      msg.includes("overloaded") ||
+      msg.includes("unavailable") ||
+      msg.includes("429") ||
+      msg.includes("503")
+    );
+  };
+
+  const runModel = async (model) => {
+    const payload = buildPayload(model);
+    return await env.AI.run(model, payload);
+  };
+
+  let result;
+  try {
+    result = await runModel(PRIMARY_MODEL);
+  } catch (primaryErr) {
+    if (!isRateOrCapacity(primaryErr)) {
+      return jsonResponse({ error: { message: primaryErr.message || "AI provider error" } }, 502, corsHeaders);
+    }
+    try {
+      result = await runModel(FALLBACK_MODEL);
+    } catch (fallbackErr) {
+      return jsonResponse({ error: { message: fallbackErr.message || "AI provider error" } }, 502, corsHeaders);
+    }
+  }
+
+  if (stream) {
+    return handleStream(result, corsHeaders);
+  }
+  return handleNonStream(result, corsHeaders);
+}
+
+function handleStream(result, corsHeaders) {
+  const encoder = new TextEncoder();
+  const stream = new TransformStream();
+  const writer = stream.writable.getWriter();
+
+  (async () => {
+    try {
+      const reader = result.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = new TextDecoder().decode(value);
+        const lines = chunk.split("\n").filter((line) => line.trim());
+        for (const line of lines) {
+          let data = line;
+          if (data.startsWith("data: ")) data = data.slice(6);
+          if (data === "[DONE]") {
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            continue;
+          }
+          let parsed;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            continue;
+          }
+          const delta = parsed.response || parsed.text || parsed.delta || parsed.choices?.[0]?.delta || {};
+          const out = JSON.stringify({
+            id: "chatcmpl-worker",
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: "@cf/qwen/qwen2.5-coder-32b-instruct",
+            choices: [{ index: 0, delta, finish_reason: null }],
+          });
+          await writer.write(encoder.encode(`data: ${out}\n\n`));
+        }
+      }
+      await writer.write(encoder.encode("data: [DONE]\n\n"));
+      await writer.close();
+    } catch (err) {
+      await writer.abort(err);
+    }
+  })();
+
+  return new Response(stream.readable, {
+    status: 200,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+
+function handleNonStream(result, corsHeaders) {
+  const text =
+    result?.response ||
+    result?.text ||
+    result?.choices?.[0]?.message?.content ||
+    result?.choices?.[0]?.text ||
+    JSON.stringify(result);
+
+  const out = {
+    id: "chatcmpl-worker",
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: "@cf/qwen/qwen2.5-coder-32b-instruct",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: text },
+        finish_reason: "stop",
+      },
+    ],
+    usage: result?.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+  return jsonResponse(out, 200, corsHeaders);
+}
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 600000) {
   const controller = new AbortController();
