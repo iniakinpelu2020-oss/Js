@@ -51,7 +51,7 @@ export default {
           status: "ok",
           worker: "apex-mcp",
           timeoutMs: 600000,
-          tools: ["github_repo_inspect", "fetch_url_text", "codespace_exec", "chat"],
+          tools: ["github_repo_inspect", "fetch_url_text", "codespace_exec", "chat", "web_search"],
         },
         200,
         corsHeaders
@@ -76,6 +76,28 @@ export default {
     // AI health endpoint
     if (request.method === "GET" && url.pathname === "/api/health") {
       return jsonResponse({ status: "ok", worker: "apex-mcp" }, 200, corsHeaders);
+    }
+
+    // Web search endpoint — server-side search returning clean JSON results
+    if (request.method === "GET" && url.pathname === "/search") {
+      return handleSearch(request, corsHeaders);
+    }
+
+    // Secret-backed proxy routes (tokens/URLs read only from env.*)
+    if (request.method === "POST" && url.pathname === "/v1/mcp/apex") {
+      return proxyJson(request, env.APEX_MCP_URL, env.MCP_TOKEN, corsHeaders);
+    }
+    if (request.method === "POST" && url.pathname === "/v1/mcp/n8n") {
+      return proxyJson(request, env.N8N_MCP_URL, env.MCP_TOKEN, corsHeaders);
+    }
+    if (request.method === "POST" && url.pathname === "/v1/webhook/n8n") {
+      return proxyJson(request, env.N8N_WEBHOOK_URL, null, corsHeaders);
+    }
+    if (request.method === "POST" && url.pathname === "/v1/exec") {
+      if (!env.REMOTE_RUNNER_URL) {
+        return jsonResponse({ error: "REMOTE_RUNNER_URL not configured" }, 500, corsHeaders);
+      }
+      return proxyJson(request, env.REMOTE_RUNNER_URL.replace(/\/$/, "") + "/exec", env.REMOTE_RUNNER_TOKEN, corsHeaders);
     }
 
     // AI chat endpoint — accepts both /api/chat and /v1/chat/completions
@@ -159,6 +181,25 @@ export default {
                         timeout_ms: { type: "number", description: "Timeout in ms (default 600000)" },
                       },
                       required: ["command"],
+                    },
+                  },
+                  {
+                    name: "web_search",
+                    description:
+                      "Search the web for up-to-date information. Returns a list of results with title, url, and snippet.",
+                    inputSchema: {
+                      type: "object",
+                      properties: {
+                        query: {
+                          type: "string",
+                          description: "Search query",
+                        },
+                        max_results: {
+                          type: "number",
+                          description: "Maximum number of results to return (default 5)",
+                        },
+                      },
+                      required: ["query"],
                     },
                   },
                 ],
@@ -274,6 +315,16 @@ export default {
               return mcpToolError(id, `Remote runner HTTP ${res.status}: ${raw.slice(0, 1000)}`, corsHeaders);
             }
             return mcpToolSuccess(id, raw, corsHeaders);
+          }
+
+          if (toolName === "web_search") {
+            const query = args.query || "";
+            const max_results = Number(args.max_results || 5);
+            if (!query) {
+              return mcpToolError(id, "Missing required parameter: query", corsHeaders);
+            }
+            const results = await performWebSearch(query, max_results);
+            return mcpToolSuccess(id, JSON.stringify({ results }, null, 2), corsHeaders);
           }
 
           return mcpToolError(id, `Unknown tool: ${toolName}`, corsHeaders);
@@ -556,6 +607,72 @@ function handleNonStream(result, corsHeaders) {
 }
 
 const PRIMARY_MODEL_NAME = "@cf/qwen/qwen2.5-coder-32b-instruct";
+
+async function handleSearch(request, corsHeaders) {
+  const { searchParams } = new URL(request.url);
+  const query = searchParams.get("q") || "";
+  const max_results = Number(searchParams.get("max_results") || 5);
+  if (!query) {
+    return jsonResponse({ error: { message: "Missing required parameter: q" } }, 400, corsHeaders);
+  }
+  const results = await performWebSearch(query, max_results);
+  return jsonResponse({ results }, 200, corsHeaders);
+}
+
+async function performWebSearch(query, max_results = 5) {
+  try {
+    const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const res = await fetchWithTimeout(ddgUrl, {
+      headers: { "User-Agent": "Apex-Studio-Worker/1.0" },
+    }, 30000);
+    if (!res.ok) {
+      return [];
+    }
+    const html = await res.text();
+    const results = [];
+    const resultRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>)?/g;
+    let match;
+    while ((match = resultRegex.exec(html)) && results.length < max_results) {
+      let url = match[1] || "";
+      let title = (match[2] || "").replace(/<[^>]*>/g, "").trim();
+      let snippet = (match[3] || "").replace(/<[^>]*>/g, "").trim();
+      if (url.startsWith("//")) url = "https:" + url;
+      if (url.startsWith("/l/?kh=")) {
+        try {
+          const ud = new URL("https://duckduckgo.com" + url);
+          const udd = ud.searchParams.get("uddg");
+          if (udd) url = udd;
+        } catch {
+          // keep as-is
+        }
+      }
+      results.push({ title, url, snippet });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+async function proxyJson(request, targetUrl, token, corsHeaders) {
+  if (!targetUrl) {
+    return jsonResponse({ error: "Target URL not configured" }, 500, corsHeaders);
+  }
+  try {
+    const body = await request.text();
+    const headers = {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const res = await fetchWithTimeout(targetUrl, { method: "POST", headers, body }, 120000);
+    const responseHeaders = new Headers(corsHeaders);
+    const ct = res.headers.get("content-type");
+    if (ct) responseHeaders.set("Content-Type", ct);
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: responseHeaders });
+  } catch (err) {
+    return jsonResponse({ error: { message: err.message || "Proxy error" } }, 502, corsHeaders);
+  }
+}
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 600000) {
   const controller = new AbortController();
